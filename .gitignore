@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# venv, if someone sets one up
+.venv/
+venv/
