@@ -20,6 +20,9 @@ import subprocess
 import time
 import signal
 
+PYTHON_EXE = sys.executable  # guarantees we relaunch with the SAME interpreter
+                              # that ran this script, bypassing PATH lookup
+
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".claude_traffic")
 STATUS_FILE = os.path.join(BASE_DIR, "status.json")
 PID_FILE = os.path.join(BASE_DIR, "gui.pid")
@@ -50,7 +53,7 @@ def start_gui():
         write_status("green")
         return
     proc = subprocess.Popen(
-        ["python3", GUI_SCRIPT],
+        [PYTHON_EXE, GUI_SCRIPT],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True
