@@ -10,13 +10,44 @@ Desktop widget showing Claude Code's status at a glance:
 
 Always-on-top, draggable, with an X button to close.
 
+**One light per Claude Code session.** Open three sessions and you get three
+lights, placed side by side, each labelled with its project folder and each
+showing only its own session's state. Close a session and its light closes
+with it.
+
 ## Files
 
 - `traffic_light.py` — the GUI widget (shared, cross-platform, no OS-specific code)
-- `status_updater_win.py` — Windows-only backend (uses `tasklist`/`taskkill`)
-- `status_updater_mac.py` — macOS-only backend (uses `ps`/`kill`)
+- `status_updater_win.py` — Windows-only backend (Win32 process handles, `taskkill`)
+- `status_updater_mac.py` — macOS-only backend (`os.kill`)
 
 Use the updater script matching your OS. Do not mix them.
+
+## How sessions are kept apart
+
+Claude Code pipes a JSON payload into every hook containing `session_id` and
+`cwd` (with `CLAUDE_CODE_SESSION_ID`, `CLAUDE_PROJECT_DIR` and `CLAUDE_PID` in
+the environment as a fallback). The updater keys everything off that:
+
+```
+~/.claude_traffic/sessions/<session_id>.json
+    {"color": "yellow", "label": "backend-api", "slot": 0,
+     "claude_pid": 55133, "gui_pid": 55137, "ts": ...}
+```
+
+- **Placement.** Each session claims the lowest free *slot*; slot *n* sits at
+  `x = 80 + n * 88`, wrapping to a second row at the screen edge. Closing a
+  session frees its slot for the next one.
+- **Label.** The basename of the session's `cwd`, shown under the lights and
+  truncated to 11 characters.
+- **`SessionStart` is idempotent.** It also fires on resume, `/clear` and
+  compaction, so a session that already has a live light never gets a second.
+- **Hard-killed terminals.** If you kill a terminal outright, `SessionEnd`
+  never fires. Each widget therefore also watches its session's `CLAUDE_PID`
+  and closes itself once that process is gone.
+- **Closing a light by hand** dismisses that widget only — the session keeps
+  running, and later hooks will not resurrect the light. Restart that session
+  to get it back.
 
 ## A note on the red-light lag
 
@@ -109,9 +140,13 @@ until the command completes.
 
 ## Known Limitations (both platforms)
 
-- **Single session only.** One shared status/PID file. Running two Claude Code sessions simultaneously will cause them to overwrite each other's status and fight over the GUI process.
-- **`SessionStart` only fires at session launch.** If you close the widget manually mid-session, it will not respawn until the next Claude Code restart.
-- **Stale PID handling.** If the GUI process crashes independently of a clean `stop`, the PID file may go stale; `stop` will fail silently rather than error. Cosmetic issue, not a functional blocker.
+- **One process per light.** Each session's widget is its own Python/Tk
+  process (~20–30 MB). Five parallel sessions means five processes. Fine in
+  practice, but it is the simple design rather than the frugal one.
+- **A manually closed light stays closed** for the rest of that session, by
+  design — see above.
+- **Long project names are truncated** to 11 characters in the label. Two
+  sessions in similarly-named folders can look alike.
 - **Approval-to-yellow lag.** See "A note on the red-light lag" above — this is a ceiling imposed by Claude Code's hook set, not a bug in this project.
 
 ## Troubleshooting
@@ -119,7 +154,9 @@ until the command completes.
 - **Widget doesn't appear:** restart Claude Code — hooks only load at session start.
 - **"can't open file" errors on Windows:** check for backslashes in your settings.json paths — use `/` instead.
 - **`macOS 14 (...) or later required` error on Mac:** see the Apple system Python note above — install Python from python.org.
-- **Two widgets appear:** kill stray `pythonw`/`python3` processes running `traffic_light.py` and restart.
+- **Two widgets for one session:** kill stray `pythonw`/`python3` processes running `traffic_light.py` and restart. (Widgets for *different* sessions are expected — that's the point.)
+- **Widgets overlap:** a slot is only freed when its session ends cleanly or its Claude Code process dies. Delete stale files in `~/.claude_traffic/sessions/` to reset.
+- **Upgrading from the single-session version:** no hook changes needed, the commands are unchanged. The first `SessionStart` retires the old `status.json`/`gui.pid` widget automatically.
 - **Light stuck on red after approving:** confirm `PostToolUse` and `PostToolUseFailure` are both present in your hooks block — see "A note on the red-light lag" above.
 
 ## License
