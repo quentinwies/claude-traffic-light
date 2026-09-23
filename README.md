@@ -18,9 +18,10 @@ with it.
 ## Files
 
 - `traffic_light.py` — the floating-window GUI widget (shared, cross-platform, no OS-specific code)
-- `traffic_light_menubar.py` — macOS-only menu bar widget, used when display mode is `menubar` (needs `rumps`)
+- `traffic_light_menubar.py` — macOS-only per-session menu bar widget, used when display mode is `menubar` (needs `rumps`)
+- `traffic_light_controller.py` — macOS-only, the fixed 🚦 menu bar switcher for changing display mode live (needs `rumps`)
 - `status_updater_win.py` — Windows-only backend (Win32 process handles, `taskkill`)
-- `status_updater_mac.py` — macOS-only backend (`os.kill`), also handles the `menubar`/`notification` display modes
+- `status_updater_mac.py` — macOS-only backend (`os.kill`), also handles the `menubar`/`notification` display modes and the controller
 
 Use the updater script matching your OS. Do not mix them.
 
@@ -142,7 +143,7 @@ alternatives are available:
 | `menubar` | A colored dot (🟢🟡🔴) in the macOS menu bar per session, with a "Close" item | `pip3 install rumps` |
 | `notification` | A macOS notification each time a session's light turns red or green — no persistent widget at all | none |
 
-Switch modes with:
+Switch modes from the terminal:
 
 ```bash
 python3 /Users/<you>/claude-traffic-light/status_updater_mac.py display menubar
@@ -152,15 +153,36 @@ python3 /Users/<you>/claude-traffic-light/status_updater_mac.py display   # prin
 ```
 
 This is a global setting (`~/.claude_traffic/config.json`), applied to every
-session, not per-hook. It takes effect for sessions started after the
-switch — restart Claude Code, or `stop` + start a running session, to move
-it over immediately.
+session at once, not per-hook — and it applies **immediately** to every
+currently running session, no restart needed: each session's old widget (if
+any) is closed and, for `window`/`menubar`, a new one for the new mode is
+spawned right away.
 
 `notification` mode has no widget process to close by hand; it just stops
 posting once the session ends. If notifications don't appear, check
 **System Settings → Notifications → Script Editor** (macOS routes
 `osascript`-fired notifications through that app) and make sure they're
 allowed.
+
+#### Switching from the menu bar instead of the terminal
+
+Once `rumps` is installed, a fixed 🚦 icon lives in the menu bar regardless
+of which display mode is active — this is the mode switcher itself, not a
+session light, so it doesn't change color and there's only ever one of it.
+`status_updater_mac.py` starts it automatically on the next `SessionStart`
+(tracked via `~/.claude_traffic/controller.pid` so only one instance ever
+runs); click it to see the three modes with the current one checked, and
+picking a different one applies it live to every running session, same as
+the `display` command. "Quit Controller" in its menu closes just that
+switcher — your session widgets keep running, and the next `SessionStart`
+brings the switcher back.
+
+You can also manage it by hand:
+
+```bash
+python3 /Users/<you>/claude-traffic-light/status_updater_mac.py controller start
+python3 /Users/<you>/claude-traffic-light/status_updater_mac.py controller stop
+```
 
 **macOS-specific notes:**
 - No `pythonw` equivalent exists — `python3` is used for both the GUI launch and one-shot status writes. Since the hook has no visible terminal, no console flashes either way.

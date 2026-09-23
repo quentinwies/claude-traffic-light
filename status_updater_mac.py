@@ -16,17 +16,25 @@ Usage:
     python3 status_updater_mac.py stop           # close this session's light
     python3 status_updater_mac.py display        # print the current display mode
     python3 status_updater_mac.py display <mode> # set it: window|menubar|notification
+    python3 status_updater_mac.py controller start|stop  # the menu bar switcher
 
-Display modes (applies to sessions started after the change):
+Display modes (applied live to every tracked session -- see switch_all_sessions):
     window       floating always-on-top widget (default)
     menubar      colored dot in the macOS menu bar (needs `pip install rumps`)
     notification a macOS notification each time the light turns red or green,
                  no persistent widget at all
 
+A fixed traffic-light icon (traffic_light_controller.py) lives in the menu
+bar whenever `rumps` is installed, independent of the chosen display mode --
+it's the switcher, not a session light. status_updater_mac.py starts it
+automatically on the first SessionStart it sees (and whenever `display` is
+run by hand) and keeps exactly one instance alive via controller.pid.
+
 State files: ~/.claude_traffic/sessions/<session_id>.json
 Config file: ~/.claude_traffic/config.json
 """
 import contextlib
+import importlib.util
 import json
 import os
 import signal
@@ -43,6 +51,8 @@ LOCK_FILE = os.path.join(BASE_DIR, "slots.lock")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 GUI_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traffic_light.py")
 MENUBAR_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traffic_light_menubar.py")
+CONTROLLER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traffic_light_controller.py")
+CONTROLLER_PID_FILE = os.path.join(BASE_DIR, "controller.pid")
 
 DISPLAY_MODES = ("window", "menubar", "notification")
 
@@ -111,6 +121,12 @@ def save_config(config):
 def display_mode():
     mode = load_config().get("display_mode", "window")
     return mode if mode in DISPLAY_MODES else "window"
+
+
+def set_display_mode(mode):
+    config = load_config()
+    config["display_mode"] = mode
+    save_config(config)
 
 
 # --- state files ------------------------------------------------------
@@ -282,6 +298,7 @@ def clear_legacy():
 
 def start_gui(session_id, label, claude_pid):
     clear_legacy()
+    ensure_controller()
     path = session_file(session_id)
     mode = display_mode()
 
@@ -336,6 +353,95 @@ def stop_gui(session_id):
     sweep()
 
 
+def switch_all_sessions(new_mode):
+    """Re-point every currently tracked session at a new display mode right
+    away, instead of waiting for its next SessionStart. Used by the menu
+    bar controller so picking a mode there applies live."""
+    for path, state in iter_states():
+        if state.get("mode", "window") == new_mode:
+            continue
+
+        gui_pid = state.get("gui_pid")
+        if gui_pid and pid_alive(gui_pid):
+            try:
+                os.kill(int(gui_pid), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+
+        session_id = os.path.basename(path)[: -len(".json")]
+        label = state.get("label", "")
+
+        if new_mode == "notification":
+            update_state(path, mode=new_mode, gui_pid=None, slot=None)
+            continue
+
+        with slot_lock():
+            slot = state.get("slot")
+            if not isinstance(slot, int):
+                sweep(skip=session_id)
+                slot = allocate_slot()
+            update_state(path, mode=new_mode, slot=slot, gui_pid=None)
+
+        script = MENUBAR_SCRIPT if new_mode == "menubar" else GUI_SCRIPT
+        proc = subprocess.Popen(
+            [PYTHON_EXE, script, "--session", session_id,
+             "--label", label, "--slot", str(slot)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        update_state(path, gui_pid=proc.pid)
+
+
+def _controller_available():
+    return importlib.util.find_spec("rumps") is not None
+
+
+def ensure_controller():
+    """Keep exactly one mode-switcher menu bar item alive, independent of
+    any single session. Best-effort and silent: a missing `rumps` just
+    means no controller, never a blocked hook."""
+    if not _controller_available():
+        return
+    pid = None
+    try:
+        with open(CONTROLLER_PID_FILE) as f:
+            pid = f.read().strip()
+    except OSError:
+        pass
+    if pid and pid_alive(pid):
+        return
+    try:
+        proc = subprocess.Popen(
+            [PYTHON_EXE, CONTROLLER_SCRIPT],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+    except OSError:
+        return
+    try:
+        with open(CONTROLLER_PID_FILE, "w") as f:
+            f.write(str(proc.pid))
+    except OSError:
+        pass
+
+
+def stop_controller():
+    pid = None
+    try:
+        with open(CONTROLLER_PID_FILE) as f:
+            pid = f.read().strip()
+    except OSError:
+        pass
+    if pid and pid_alive(pid):
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+    _discard(CONTROLLER_PID_FILE)
+
+
 def notify(color, label):
     """Fire a macOS notification for a red/green transition. Best-effort --
     a notification that doesn't show (e.g. Script Editor notifications
@@ -376,14 +482,20 @@ def main():
                 print(f"Unknown display mode {mode!r}. Choose from: {', '.join(DISPLAY_MODES)}",
                       file=sys.stderr)
                 sys.exit(1)
-            config = load_config()
-            config["display_mode"] = mode
-            save_config(config)
-            print(f"Display mode set to {mode!r}. Applies to sessions started from now on "
-                  f"-- restart Claude Code, or run 'stop' then start a new session, to apply "
-                  f"it to an already-running one.")
+            set_display_mode(mode)
+            switch_all_sessions(mode)
+            print(f"Display mode set to {mode!r} and applied to every running session.")
         else:
             print(display_mode())
+        ensure_controller()
+        return
+
+    if cmd == "controller":
+        sub = sys.argv[2] if len(sys.argv) >= 3 else "start"
+        if sub == "stop":
+            stop_controller()
+        else:
+            ensure_controller()
         return
 
     session_id, label, claude_pid = session_identity(hook_payload())
