@@ -5,8 +5,8 @@ using os.kill instead of tasklist/taskkill.
 
 One light per Claude Code session: the session id arrives on stdin as
 part of the hook payload (falling back to $CLAUDE_CODE_SESSION_ID), and
-each session gets its own state file, its own GUI process and its own
-screen slot.
+each session gets its own state file, its own GUI process (if the
+display mode uses one) and its own screen slot.
 
 Usage:
     python3 status_updater_mac.py start          # launch this session's light
@@ -14,8 +14,17 @@ Usage:
     python3 status_updater_mac.py red            # needs your input
     python3 status_updater_mac.py green          # idle
     python3 status_updater_mac.py stop           # close this session's light
+    python3 status_updater_mac.py display        # print the current display mode
+    python3 status_updater_mac.py display <mode> # set it: window|menubar|notification
+
+Display modes (applies to sessions started after the change):
+    window       floating always-on-top widget (default)
+    menubar      colored dot in the macOS menu bar (needs `pip install rumps`)
+    notification a macOS notification each time the light turns red or green,
+                 no persistent widget at all
 
 State files: ~/.claude_traffic/sessions/<session_id>.json
+Config file: ~/.claude_traffic/config.json
 """
 import contextlib
 import json
@@ -31,7 +40,11 @@ PYTHON_EXE = sys.executable  # guarantees we relaunch with the SAME interpreter
 BASE_DIR = os.path.join(os.path.expanduser("~"), ".claude_traffic")
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
 LOCK_FILE = os.path.join(BASE_DIR, "slots.lock")
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 GUI_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traffic_light.py")
+MENUBAR_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "traffic_light_menubar.py")
+
+DISPLAY_MODES = ("window", "menubar", "notification")
 
 # Pre-1.1 single-session layout, cleaned up on first start.
 LEGACY_STATUS_FILE = os.path.join(BASE_DIR, "status.json")
@@ -75,6 +88,29 @@ def session_identity(payload):
 
 def session_file(session_id):
     return os.path.join(SESSIONS_DIR, session_id + ".json")
+
+
+# --- display mode -------------------------------------------------------
+
+def load_config():
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            config = json.load(f)
+        return config if isinstance(config, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        return {}
+
+
+def save_config(config):
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(config, f)
+    os.replace(tmp, CONFIG_FILE)
+
+
+def display_mode():
+    mode = load_config().get("display_mode", "window")
+    return mode if mode in DISPLAY_MODES else "window"
 
 
 # --- state files ------------------------------------------------------
@@ -186,19 +222,21 @@ def slot_lock(timeout=2.0):
 
 def sweep(skip=None):
     """Drop state files whose widget or whose Claude Code session is gone,
-    so their slots become available again."""
+    so their slots become available again. Notification-mode sessions have
+    no widget process to check -- they live or die with claude_pid alone."""
     now = time.time()
     for path, state in iter_states():
         if skip and os.path.basename(path) == skip + ".json":
             continue
         gui_pid = state.get("gui_pid")
-        if gui_pid:
-            if not pid_alive(gui_pid):
+        if state.get("mode") != "notification":
+            if gui_pid:
+                if not pid_alive(gui_pid):
+                    _discard(path)
+                    continue
+            elif now - state.get("ts", 0) > STARTUP_GRACE_S:
                 _discard(path)
                 continue
-        elif now - state.get("ts", 0) > STARTUP_GRACE_S:
-            _discard(path)
-            continue
         claude_pid = state.get("claude_pid")
         if claude_pid and not pid_alive(claude_pid):
             if gui_pid and pid_alive(gui_pid):
@@ -245,22 +283,37 @@ def clear_legacy():
 def start_gui(session_id, label, claude_pid):
     clear_legacy()
     path = session_file(session_id)
+    mode = display_mode()
 
     existing = load_state(path)
-    if existing and pid_alive(existing.get("gui_pid")):
+    already_running = existing and (
+        mode == "notification" or pid_alive(existing.get("gui_pid"))
+    )
+    if already_running:
         # SessionStart also fires on resume/clear/compact -- don't spawn a
-        # second light for a session that already has one.
-        update_state(path, color="green", label=label, claude_pid=claude_pid)
+        # second light (or double-count a notification session) for a
+        # session that's already tracked.
+        update_state(path, color="green", label=label, claude_pid=claude_pid, mode=mode)
+        return
+
+    if mode == "notification":
+        # No widget process at all -- just a state file that write_status
+        # diffs against to fire notifications on red/green transitions.
+        with slot_lock():
+            sweep(skip=session_id)
+        update_state(path, color="green", label=label, claude_pid=claude_pid,
+                     gui_pid=None, slot=None, mode=mode)
         return
 
     with slot_lock():
         sweep(skip=session_id)
         slot = allocate_slot()
         update_state(path, color="green", label=label, slot=slot,
-                     claude_pid=claude_pid, gui_pid=None)
+                     claude_pid=claude_pid, gui_pid=None, mode=mode)
 
+    script = MENUBAR_SCRIPT if mode == "menubar" else GUI_SCRIPT
     proc = subprocess.Popen(
-        [PYTHON_EXE, GUI_SCRIPT, "--session", session_id,
+        [PYTHON_EXE, script, "--session", session_id,
          "--label", label, "--slot", str(slot)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -283,6 +336,21 @@ def stop_gui(session_id):
     sweep()
 
 
+def notify(color, label):
+    """Fire a macOS notification for a red/green transition. Best-effort --
+    a notification that doesn't show (e.g. Script Editor notifications
+    disabled in System Settings) must never block the hook."""
+    def esc(s):
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    message = f"{label} needs your input" if color == "red" else f"{label} is idle"
+    script = f'display notification "{esc(message)}" with title "{esc("Claude Code")}"'
+    try:
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def write_status(session_id, color):
     """No-op when the session has no state file: either the session never
     started a light, or the user closed it by hand and shouldn't get it
@@ -290,13 +358,34 @@ def write_status(session_id, color):
     path = session_file(session_id)
     if not os.path.exists(path):
         return
-    update_state(path, color=color)
+    prev_color = (load_state(path) or {}).get("color")
+    state = update_state(path, color=color)
+    if state.get("mode") == "notification" and color != prev_color and color in ("red", "green"):
+        notify(color, state.get("label") or "Claude Code")
 
 
 def main():
     if len(sys.argv) < 2:
         sys.exit(0)
     cmd = sys.argv[1]
+
+    if cmd == "display":
+        if len(sys.argv) >= 3:
+            mode = sys.argv[2]
+            if mode not in DISPLAY_MODES:
+                print(f"Unknown display mode {mode!r}. Choose from: {', '.join(DISPLAY_MODES)}",
+                      file=sys.stderr)
+                sys.exit(1)
+            config = load_config()
+            config["display_mode"] = mode
+            save_config(config)
+            print(f"Display mode set to {mode!r}. Applies to sessions started from now on "
+                  f"-- restart Claude Code, or run 'stop' then start a new session, to apply "
+                  f"it to an already-running one.")
+        else:
+            print(display_mode())
+        return
+
     session_id, label, claude_pid = session_identity(hook_payload())
 
     if cmd == "start":

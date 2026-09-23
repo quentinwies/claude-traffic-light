@@ -17,9 +17,10 @@ with it.
 
 ## Files
 
-- `traffic_light.py` — the GUI widget (shared, cross-platform, no OS-specific code)
+- `traffic_light.py` — the floating-window GUI widget (shared, cross-platform, no OS-specific code)
+- `traffic_light_menubar.py` — macOS-only menu bar widget, used when display mode is `menubar` (needs `rumps`)
 - `status_updater_win.py` — Windows-only backend (Win32 process handles, `taskkill`)
-- `status_updater_mac.py` — macOS-only backend (`os.kill`)
+- `status_updater_mac.py` — macOS-only backend (`os.kill`), also handles the `menubar`/`notification` display modes
 
 Use the updater script matching your OS. Do not mix them.
 
@@ -130,6 +131,37 @@ until the command completes.
 4. **Strongly recommended: use a full interpreter path instead of bare `python3`.** The hook shell may not resolve `python3` the same way your interactive terminal does, especially if you're relying on a `PATH` entry added to `~/.zshrc` (e.g. after installing Python from python.org). Find your path with `which python3` and use the full path in every hook command, e.g. `/Library/Frameworks/Python.framework/Versions/3.13/bin/python3`.
 5. Restart Claude Code. Hooks load at session start only.
 
+### Display modes (macOS only)
+
+By default you get the floating always-on-top window described above. Two
+alternatives are available:
+
+| Mode | What you get | Extra setup |
+|---|---|---|
+| `window` (default) | The floating widget, one per session | none |
+| `menubar` | A colored dot (🟢🟡🔴) in the macOS menu bar per session, with a "Close" item | `pip3 install rumps` |
+| `notification` | A macOS notification each time a session's light turns red or green — no persistent widget at all | none |
+
+Switch modes with:
+
+```bash
+python3 /Users/<you>/claude-traffic-light/status_updater_mac.py display menubar
+python3 /Users/<you>/claude-traffic-light/status_updater_mac.py display notification
+python3 /Users/<you>/claude-traffic-light/status_updater_mac.py display window
+python3 /Users/<you>/claude-traffic-light/status_updater_mac.py display   # print current mode
+```
+
+This is a global setting (`~/.claude_traffic/config.json`), applied to every
+session, not per-hook. It takes effect for sessions started after the
+switch — restart Claude Code, or `stop` + start a running session, to move
+it over immediately.
+
+`notification` mode has no widget process to close by hand; it just stops
+posting once the session ends. If notifications don't appear, check
+**System Settings → Notifications → Script Editor** (macOS routes
+`osascript`-fired notifications through that app) and make sure they're
+allowed.
+
 **macOS-specific notes:**
 - No `pythonw` equivalent exists — `python3` is used for both the GUI launch and one-shot status writes. Since the hook has no visible terminal, no console flashes either way.
 - Process management uses `os.kill()` (signal 0 for existence check, `SIGTERM` to stop) instead of `tasklist`/`taskkill`.
@@ -148,6 +180,7 @@ until the command completes.
 - **Long project names are truncated** to 11 characters in the label. Two
   sessions in similarly-named folders can look alike.
 - **Approval-to-yellow lag.** See "A note on the red-light lag" above — this is a ceiling imposed by Claude Code's hook set, not a bug in this project.
+- **Display mode is global, macOS only.** All sessions on a Mac share one `menubar`/`notification`/`window` setting from `~/.claude_traffic/config.json`; there's no per-session override, and Windows always uses the floating window.
 
 ## Troubleshooting
 
