@@ -14,19 +14,21 @@ Usage:
     python3 status_updater_mac.py red            # needs your input
     python3 status_updater_mac.py green          # idle
     python3 status_updater_mac.py stop           # close this session's light
-    python3 status_updater_mac.py display        # print the current display mode
-    python3 status_updater_mac.py display <mode> # set it: window|menubar|notification
+    python3 status_updater_mac.py display              # print the active display modes
+    python3 status_updater_mac.py display <mode...>    # set them, e.g. "display menubar notification"
     python3 status_updater_mac.py controller start|stop  # the menu bar switcher
 
-Display modes (applied live to every tracked session -- see switch_all_sessions):
+Display modes -- any combination is valid, applied live to every tracked
+session (see switch_active_modes):
     window       floating always-on-top widget (default)
     menubar      colored dot in the macOS menu bar (needs `pip install rumps`)
-    notification a macOS notification each time the light turns red or green,
-                 no persistent widget at all
+    notification a macOS notification each time the light turns red or green
 
 A fixed traffic-light icon (traffic_light_controller.py) lives in the menu
-bar whenever `rumps` is installed, independent of the chosen display mode --
-it's the switcher, not a session light. status_updater_mac.py starts it
+bar whenever `rumps` is installed, independent of the chosen display
+mode(s) -- it's the switcher, not a session light. Its dropdown is a set of
+independent checkboxes, so e.g. menubar + notification together is a normal
+combination, not just one mode at a time. status_updater_mac.py starts it
 automatically on the first SessionStart it sees (and whenever `display` is
 run by hand) and keeps exactly one instance alive via controller.pid.
 
@@ -118,14 +120,19 @@ def save_config(config):
     os.replace(tmp, CONFIG_FILE)
 
 
-def display_mode():
-    mode = load_config().get("display_mode", "window")
-    return mode if mode in DISPLAY_MODES else "window"
+def active_modes():
+    """The set of currently enabled display modes. Any combination of
+    DISPLAY_MODES is valid, including empty (deliberately silenced) --
+    only a missing/corrupt config falls back to the {"window"} default."""
+    modes = load_config().get("display_modes")
+    if not isinstance(modes, list):
+        return {"window"}
+    return {m for m in modes if m in DISPLAY_MODES}
 
 
-def set_display_mode(mode):
+def set_active_modes(modes):
     config = load_config()
-    config["display_mode"] = mode
+    config["display_modes"] = sorted(set(modes) & set(DISPLAY_MODES))
     save_config(config)
 
 
@@ -237,29 +244,39 @@ def slot_lock(timeout=2.0):
 
 
 def sweep(skip=None):
-    """Drop state files whose widget or whose Claude Code session is gone,
-    so their slots become available again. Notification-mode sessions have
-    no widget process to check -- they live or die with claude_pid alone."""
+    """Drop state files whose widget(s) or whose Claude Code session is
+    gone, so their slots become available again. A session can have zero,
+    one or two widget processes (window and/or menubar) depending on its
+    modes; notification needs none at all."""
     now = time.time()
     for path, state in iter_states():
         if skip and os.path.basename(path) == skip + ".json":
             continue
-        gui_pid = state.get("gui_pid")
-        if state.get("mode") != "notification":
-            if gui_pid:
-                if not pid_alive(gui_pid):
-                    _discard(path)
-                    continue
-            elif now - state.get("ts", 0) > STARTUP_GRACE_S:
-                _discard(path)
-                continue
+
+        modes = state.get("modes") or []
+        widgets = state.get("widgets") or {}
+        wanted = [k for k in ("window", "menubar") if k in modes]
+        recorded = {k: widgets.get(k) for k in wanted}
+
+        # A widget that should exist but died unexpectedly (not via its own
+        # close(), which deletes this file itself) orphans the session.
+        if any(pid and not pid_alive(pid) for pid in recorded.values()):
+            _discard(path)
+            continue
+        # Still waiting for a widget this session is supposed to have --
+        # give the spawning process a moment before assuming it failed.
+        if wanted and not all(recorded.values()) and now - state.get("ts", 0) > STARTUP_GRACE_S:
+            _discard(path)
+            continue
+
         claude_pid = state.get("claude_pid")
         if claude_pid and not pid_alive(claude_pid):
-            if gui_pid and pid_alive(gui_pid):
-                try:
-                    os.kill(int(gui_pid), signal.SIGTERM)
-                except (OSError, ValueError):
-                    pass
+            for pid in widgets.values():
+                if pid and pid_alive(pid):
+                    try:
+                        os.kill(int(pid), signal.SIGTERM)
+                    except (OSError, ValueError):
+                        pass
             _discard(path)
 
 
@@ -296,101 +313,85 @@ def clear_legacy():
 
 # --- commands ---------------------------------------------------------
 
+def reconcile_widgets(path, state, modes):
+    """Make this session's running widget processes match `modes`: stop any
+    widget whose kind fell out of the set, start any missing one whose kind
+    is now wanted, leave one already running alone. Idempotent -- safe to
+    call on every SessionStart and every mode change. Notification has no
+    process of its own; write_status() checks `modes` at fire time."""
+    widgets = dict(state.get("widgets") or {})
+    session_id = os.path.basename(path)[: -len(".json")]
+    label = state.get("label", "")
+    slot = state.get("slot")
+
+    for kind in ("window", "menubar"):
+        pid = widgets.get(kind)
+        if kind not in modes:
+            if pid and pid_alive(pid):
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
+            widgets[kind] = None
+            continue
+        if pid and pid_alive(pid):
+            continue  # already running as wanted
+        if slot is None:
+            with slot_lock():
+                sweep(skip=session_id)
+                slot = allocate_slot()
+        proc = subprocess.Popen(
+            [PYTHON_EXE, MENUBAR_SCRIPT if kind == "menubar" else GUI_SCRIPT,
+             "--session", session_id, "--label", label, "--slot", str(slot)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True
+        )
+        widgets[kind] = proc.pid
+
+    update_state(path, modes=sorted(modes), widgets=widgets, slot=slot)
+
+
 def start_gui(session_id, label, claude_pid):
     clear_legacy()
     ensure_controller()
     path = session_file(session_id)
-    mode = display_mode()
+    modes = active_modes()
 
-    existing = load_state(path)
-    already_running = existing and (
-        mode == "notification" or pid_alive(existing.get("gui_pid"))
-    )
-    if already_running:
-        # SessionStart also fires on resume/clear/compact -- don't spawn a
-        # second light (or double-count a notification session) for a
-        # session that's already tracked.
-        update_state(path, color="green", label=label, claude_pid=claude_pid, mode=mode)
-        return
-
-    if mode == "notification":
-        # No widget process at all -- just a state file that write_status
-        # diffs against to fire notifications on red/green transitions.
+    if load_state(path) is None:
         with slot_lock():
             sweep(skip=session_id)
-        update_state(path, color="green", label=label, claude_pid=claude_pid,
-                     gui_pid=None, slot=None, mode=mode)
-        return
+            update_state(path, color="green", label=label, claude_pid=claude_pid,
+                         modes=sorted(modes), widgets={})
+    else:
+        # SessionStart also fires on resume/clear/compact -- refresh the
+        # header fields, then let reconcile bring widgets up to date
+        # rather than assuming a stale one is still alive.
+        update_state(path, color="green", label=label, claude_pid=claude_pid)
 
-    with slot_lock():
-        sweep(skip=session_id)
-        slot = allocate_slot()
-        update_state(path, color="green", label=label, slot=slot,
-                     claude_pid=claude_pid, gui_pid=None, mode=mode)
-
-    script = MENUBAR_SCRIPT if mode == "menubar" else GUI_SCRIPT
-    proc = subprocess.Popen(
-        [PYTHON_EXE, script, "--session", session_id,
-         "--label", label, "--slot", str(slot)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True
-    )
-    update_state(path, gui_pid=proc.pid)
+    reconcile_widgets(path, load_state(path), modes)
 
 
 def stop_gui(session_id):
     path = session_file(session_id)
     state = load_state(path)
     if state:
-        gui_pid = state.get("gui_pid")
-        if gui_pid and pid_alive(gui_pid):
-            try:
-                os.kill(int(gui_pid), signal.SIGTERM)
-            except (OSError, ValueError):
-                pass
+        for pid in (state.get("widgets") or {}).values():
+            if pid and pid_alive(pid):
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
     _discard(path)
     sweep()
 
 
-def switch_all_sessions(new_mode):
-    """Re-point every currently tracked session at a new display mode right
-    away, instead of waiting for its next SessionStart. Used by the menu
-    bar controller so picking a mode there applies live."""
+def switch_active_modes(new_modes):
+    """Re-point every currently tracked session at a new set of display
+    modes right away, instead of waiting for its next SessionStart. Used
+    by the menu bar controller so toggling a mode there applies live."""
     for path, state in iter_states():
-        if state.get("mode", "window") == new_mode:
-            continue
-
-        gui_pid = state.get("gui_pid")
-        if gui_pid and pid_alive(gui_pid):
-            try:
-                os.kill(int(gui_pid), signal.SIGTERM)
-            except (OSError, ValueError):
-                pass
-
-        session_id = os.path.basename(path)[: -len(".json")]
-        label = state.get("label", "")
-
-        if new_mode == "notification":
-            update_state(path, mode=new_mode, gui_pid=None, slot=None)
-            continue
-
-        with slot_lock():
-            slot = state.get("slot")
-            if not isinstance(slot, int):
-                sweep(skip=session_id)
-                slot = allocate_slot()
-            update_state(path, mode=new_mode, slot=slot, gui_pid=None)
-
-        script = MENUBAR_SCRIPT if new_mode == "menubar" else GUI_SCRIPT
-        proc = subprocess.Popen(
-            [PYTHON_EXE, script, "--session", session_id,
-             "--label", label, "--slot", str(slot)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True
-        )
-        update_state(path, gui_pid=proc.pid)
+        reconcile_widgets(path, state, new_modes)
 
 
 def _controller_available():
@@ -442,15 +443,53 @@ def stop_controller():
     _discard(CONTROLLER_PID_FILE)
 
 
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+NOTIFY_ICON = {"red": os.path.join(ASSETS_DIR, "dot-red.png"),
+               "green": os.path.join(ASSETS_DIR, "dot-green.png")}
+NOTIFY_COPY = {
+    "red": ("Needs your input", "A permission prompt is waiting for you."),
+    "green": ("Idle", "Finished and ready for your next prompt."),
+}
+
+
+def _terminal_notifier():
+    import shutil
+    return shutil.which("terminal-notifier")
+
+
 def notify(color, label):
     """Fire a macOS notification for a red/green transition. Best-effort --
-    a notification that doesn't show (e.g. Script Editor notifications
-    disabled in System Settings) must never block the hook."""
+    a notification that doesn't show (e.g. permission not granted) must
+    never block the hook.
+
+    Prefers `terminal-notifier` (a real colored dot as the notification's
+    app icon); falls back to plain osascript if it isn't installed, which
+    can't show a custom icon but still gets the wording right."""
+    title = label or "Claude Code"
+    subtitle, message = NOTIFY_COPY[color]
+
+    notifier = _terminal_notifier()
+    if notifier:
+        args = [notifier, "-title", title, "-subtitle", subtitle, "-message", message,
+                "-appIcon", NOTIFY_ICON[color], "-group", "claude-traffic-light-" + title]
+        if color == "red":
+            args += ["-sound", "default"]
+        try:
+            subprocess.run(args, capture_output=True, timeout=5)
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass  # fall through to the osascript fallback below
+
     def esc(s):
         return s.replace("\\", "\\\\").replace('"', '\\"')
 
-    message = f"{label} needs your input" if color == "red" else f"{label} is idle"
-    script = f'display notification "{esc(message)}" with title "{esc("Claude Code")}"'
+    icon = "\U0001F534" if color == "red" else "\U0001F7E2"
+    script = (
+        f'display notification "{esc(message)}" '
+        f'with title "{esc(icon + " " + title)}" subtitle "{esc(subtitle)}"'
+    )
+    if color == "red":
+        script += ' sound name "Ping"'
     try:
         subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
@@ -466,7 +505,8 @@ def write_status(session_id, color):
         return
     prev_color = (load_state(path) or {}).get("color")
     state = update_state(path, color=color)
-    if state.get("mode") == "notification" and color != prev_color and color in ("red", "green"):
+    modes = state.get("modes") or []
+    if "notification" in modes and color != prev_color and color in ("red", "green"):
         notify(color, state.get("label") or "Claude Code")
 
 
@@ -477,16 +517,19 @@ def main():
 
     if cmd == "display":
         if len(sys.argv) >= 3:
-            mode = sys.argv[2]
-            if mode not in DISPLAY_MODES:
-                print(f"Unknown display mode {mode!r}. Choose from: {', '.join(DISPLAY_MODES)}",
+            modes = sys.argv[2:]
+            invalid = [m for m in modes if m not in DISPLAY_MODES]
+            if invalid:
+                print(f"Unknown display mode(s): {', '.join(invalid)}. Choose from: {', '.join(DISPLAY_MODES)}",
                       file=sys.stderr)
                 sys.exit(1)
-            set_display_mode(mode)
-            switch_all_sessions(mode)
-            print(f"Display mode set to {mode!r} and applied to every running session.")
+            modes = set(modes)
+            set_active_modes(modes)
+            switch_active_modes(modes)
+            print(f"Display modes set to {{{', '.join(sorted(modes)) or '(none)'}}} "
+                  f"and applied to every running session.")
         else:
-            print(display_mode())
+            print(", ".join(sorted(active_modes())) or "(none)")
         ensure_controller()
         return
 

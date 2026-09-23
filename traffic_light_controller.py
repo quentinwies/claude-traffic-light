@@ -1,9 +1,13 @@
 """
 traffic_light_controller.py
 macOS-only: a single, session-independent menu bar item -- a fixed traffic
-light icon that never changes color -- for switching the display mode
-(window / menu bar / notification) that every tracked Claude Code session
-uses. Requires `rumps` (pip install rumps).
+light icon that never changes color -- for choosing which display mode(s)
+(window / menu bar / notification) every tracked Claude Code session uses.
+Requires `rumps` (pip install rumps).
+
+The three modes are independent checkboxes, not a radio choice: menu bar
++ notification together is a normal combination, and toggling one never
+clears the others.
 
 Unlike traffic_light.py and traffic_light_menubar.py, this isn't a session
 light: it doesn't watch any particular session or Claude Code process, and
@@ -13,9 +17,9 @@ time; status_updater_mac.py starts it (if not already running, tracked via
 `display` is run by hand, and it keeps running until quit from its own
 menu or the machine restarts.
 
-Picking a mode here calls status_updater_mac.switch_all_sessions(), which
-applies it to every currently tracked session immediately -- no restart of
-Claude Code needed.
+Toggling a mode here calls status_updater_mac.switch_active_modes(), which
+applies the new set to every currently tracked session immediately -- no
+restart of Claude Code needed.
 """
 import os
 
@@ -37,24 +41,26 @@ class Controller(rumps.App):
         super().__init__(name="Claude Traffic Light Controller", title=ICON, quit_button=None)
         self.mode_items = {}
         for mode in backend.DISPLAY_MODES:
-            item = rumps.MenuItem(MODE_LABELS[mode], callback=self._make_selector(mode))
+            item = rumps.MenuItem(MODE_LABELS[mode], callback=self._make_toggle(mode))
             self.mode_items[mode] = item
         self.menu = list(self.mode_items.values()) + [
             None, rumps.MenuItem("Quit Controller", callback=self.quit)
         ]
         self.refresh_checks()
 
-    def _make_selector(self, mode):
-        def select(_sender):
-            backend.set_display_mode(mode)
-            backend.switch_all_sessions(mode)
+    def _make_toggle(self, mode):
+        def toggle(_sender):
+            current = backend.active_modes()
+            current = (current - {mode}) if mode in current else (current | {mode})
+            backend.set_active_modes(current)
+            backend.switch_active_modes(current)
             self.refresh_checks()
-        return select
+        return toggle
 
     def refresh_checks(self):
-        current = backend.display_mode()
+        current = backend.active_modes()
         for mode, item in self.mode_items.items():
-            item.state = (mode == current)
+            item.state = mode in current
 
     def quit(self, _sender=None):
         try:
