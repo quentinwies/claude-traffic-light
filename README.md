@@ -20,7 +20,7 @@ with it.
 - `traffic_light.py` — the floating-window GUI widget (shared, cross-platform, no OS-specific code)
 - `traffic_light_menubar.py` — macOS-only per-session menu bar widget, used when display mode is `menubar` (needs `rumps`)
 - `traffic_light_controller.py` — macOS-only, the fixed 🚦 menu bar switcher for changing display mode(s) live (needs `rumps`)
-- `assets/dot-red.png`, `assets/dot-green.png` — the colored-dot notification icons used when `terminal-notifier` is installed
+- `assets/traffic-light.png` — the app icon of the small notifier app that `notification` mode builds on first use
 - `status_updater_win.py` — Windows-only backend (Win32 process handles, `taskkill`)
 - `status_updater_mac.py` — macOS-only backend (`os.kill`), also handles the `menubar`/`notification` display modes and the controller
 
@@ -143,7 +143,7 @@ at once** — e.g. a menu bar dot plus notifications, with no window:
 |---|---|---|
 | `window` (default) | The floating widget, one per session | none |
 | `menubar` | A colored dot (🟢🟡🔴) in the macOS menu bar per session, with a "Close" item | `pip3 install rumps` |
-| `notification` | A macOS notification each time a session's light turns red or green | none (a nicer, icon-carrying one needs `brew install terminal-notifier`) |
+| `notification` | A macOS notification each time a session's light turns red or green | none |
 
 Switch modes from the terminal — pass however many you want active:
 
@@ -161,9 +161,9 @@ running session, no restart needed: a widget whose mode fell out of the set
 is closed, and one whose mode is newly active is spawned right away.
 
 If notifications don't appear at all, check **System Settings →
-Notifications** for `terminal-notifier` (if installed) or **Script Editor**
-(the app plain `osascript` notifications are routed through) and make sure
-they're allowed.
+Notifications** for **Claude Traffic Light** (or **Script Editor**, if the
+notifier app couldn't be built and plain `osascript` is used instead) and
+make sure they're allowed.
 
 #### Switching from the menu bar instead of the terminal
 
@@ -178,7 +178,9 @@ and Notification together is normal; toggling one never clears the others.
 Every click applies live to every running session, same as the `display`
 command. "Quit Controller" in its menu closes just that switcher — your
 session widgets keep running, and the next `SessionStart` brings the
-switcher back.
+switcher back. It also closes on its own once the last Claude Code session
+ends: `SessionEnd` of the last session stops it, and as a fallback for
+hard-killed terminals it checks every 10 s whether any session is left.
 
 You can also manage it by hand:
 
@@ -187,28 +189,29 @@ python3 /Users/<you>/claude-traffic-light/status_updater_mac.py controller start
 python3 /Users/<you>/claude-traffic-light/status_updater_mac.py controller stop
 ```
 
-#### Nicer notifications with `terminal-notifier`
+#### How notifications look
 
-Plain `osascript` notifications always carry Script Editor's icon — macOS
-gives `display notification` no way to set its own. Installing
-[`terminal-notifier`](https://github.com/julienXX/terminal-notifier)
-(`brew install terminal-notifier`) is what actually changes the icon: once
-it's on your `PATH`, `notify()` in `status_updater_mac.py` picks it up
-automatically and switches to it, showing the same red/green dot as the
-menu bar and window widgets (`assets/dot-red.png` / `assets/dot-green.png`)
-as the notification's icon, with a title (session label), subtitle
-("Needs your input" / "Idle") and a short message, plus a sound on red.
+Each notification has the git repo name as its title, prefixed with 🟢 or 🔴,
+and one short line underneath ("Claude finished" / "Claude needs your
+input"), plus a sound on red. Outside a git repo the folder name is used.
 
-**Without it** (including if the `brew install` itself fails — see below),
-you still get that same wording via `osascript`, just with an emoji
-prefixed in the title instead of a custom icon.
+macOS always shows the *sending app's* icon on a notification, and plain
+`osascript` notifications come from Script Editor. So on first use
+`status_updater_mac.py` builds a tiny AppleScript droplet,
+`~/.claude_traffic/Claude Traffic Light.app`, with the 🚦 icon from
+`assets/traffic-light.png`, and sends every notification through it. It
+only uses tools that ship with macOS (`osacompile`, `sips`, `iconutil`,
+`codesign`) — no Xcode, no Homebrew. macOS asks once whether "Claude
+Traffic Light" may send notifications. If building it fails for any reason,
+notifications fall back to plain `osascript` with the same wording.
 
-> On Intel Macs still on macOS 14, Homebrew has no prebuilt bottle for
-> `terminal-notifier` (a "Tier 3" configuration) and falls back to
-> compiling it from source, which needs a full Xcode.app install (several
-> GB from the App Store) — the Command Line Tools alone aren't enough. If
-> you don't want to install Xcode just for this, skip it; the `osascript`
-> fallback covers the same wording.
+The app is rebuilt automatically whenever `NOTIFIER_VERSION` in
+`status_updater_mac.py` changes. Bump it after changing the icon or the
+droplet's script: the version is also part of the app's bundle id, because
+Notification Center caches icons per bundle id and would otherwise keep
+showing the old one. A new bundle id means macOS asks for notification
+permission once more. To force a rebuild without bumping, delete the app;
+it's recreated on the next notification.
 
 **macOS-specific notes:**
 - No `pythonw` equivalent exists — `python3` is used for both the GUI launch and one-shot status writes. Since the hook has no visible terminal, no console flashes either way.

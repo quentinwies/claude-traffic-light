@@ -95,7 +95,22 @@ def session_identity(payload):
     claude_pid = os.environ.get("CLAUDE_PID")
     # Keep the id filesystem-safe; real ids are uuids, but don't trust that.
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(session_id))
-    return safe_id, os.path.basename(os.path.normpath(cwd)) or cwd, claude_pid
+    return safe_id, os.path.basename(os.path.normpath(cwd)) or cwd, claude_pid, cwd
+
+
+def repo_name(cwd):
+    """Name of the git repository containing `cwd` (so a session opened in
+    a subfolder still reports the repo), else the folder name itself. Only
+    called on SessionStart, never on the per-tool-call colour writes."""
+    try:
+        result = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                                capture_output=True, text=True, timeout=2)
+        top = result.stdout.strip()
+        if result.returncode == 0 and top:
+            return os.path.basename(top)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.path.basename(os.path.normpath(cwd)) or cwd
 
 
 def session_file(session_id):
@@ -352,22 +367,23 @@ def reconcile_widgets(path, state, modes):
     update_state(path, modes=sorted(modes), widgets=widgets, slot=slot)
 
 
-def start_gui(session_id, label, claude_pid):
+def start_gui(session_id, label, claude_pid, cwd):
     clear_legacy()
     ensure_controller()
     path = session_file(session_id)
     modes = active_modes()
+    repo = repo_name(cwd)
 
     if load_state(path) is None:
         with slot_lock():
             sweep(skip=session_id)
-            update_state(path, color="green", label=label, claude_pid=claude_pid,
+            update_state(path, color="green", label=label, repo=repo, claude_pid=claude_pid,
                          modes=sorted(modes), widgets={})
     else:
         # SessionStart also fires on resume/clear/compact -- refresh the
         # header fields, then let reconcile bring widgets up to date
         # rather than assuming a stale one is still alive.
-        update_state(path, color="green", label=label, claude_pid=claude_pid)
+        update_state(path, color="green", label=label, repo=repo, claude_pid=claude_pid)
 
     reconcile_widgets(path, load_state(path), modes)
 
@@ -384,6 +400,12 @@ def stop_gui(session_id):
                     pass
     _discard(path)
     sweep()
+    if not any_sessions():
+        stop_controller()  # last session gone -- take the switcher with it
+
+
+def any_sessions():
+    return next(iter_states(), None) is not None
 
 
 def switch_active_modes(new_modes):
@@ -444,52 +466,159 @@ def stop_controller():
 
 
 ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
-NOTIFY_ICON = {"red": os.path.join(ASSETS_DIR, "dot-red.png"),
-               "green": os.path.join(ASSETS_DIR, "dot-green.png")}
-NOTIFY_COPY = {
-    "red": ("Needs your input", "A permission prompt is waiting for you."),
-    "green": ("Idle", "Finished and ready for your next prompt."),
-}
+NOTIFY_EMOJI = {"red": "\U0001F534", "green": "\U0001F7E2"}
+NOTIFY_MESSAGE = {"red": "Claude needs your input", "green": "Claude finished"}
+
+# macOS shows the *sending app's* icon on a notification, and plain
+# osascript notifications come from Script Editor. So notify() goes through
+# a tiny AppleScript droplet of our own, built on first use with tools that
+# ship with macOS (osacompile, sips, iconutil, codesign -- no Xcode), whose
+# app icon is assets/traffic-light.png. It can't take command-line
+# arguments, so each notification is a small text file handed to its
+# `on open` handler: title, message, sound name, one per line.
+NOTIFIER_NAME = "Claude Traffic Light"
+NOTIFIER_APP = os.path.join(BASE_DIR, NOTIFIER_NAME + ".app")
+NOTIFIER_ICON = os.path.join(ASSETS_DIR, "traffic-light.png")
+NOTIFY_QUEUE_DIR = os.path.join(BASE_DIR, "notify")
+# Bump when the droplet's script or icon changes -- the app is rebuilt
+# whenever its stamp doesn't match. It's also part of the bundle id:
+# Notification Center caches app icons per bundle id and never notices a
+# new icon under an old id (macOS then asks for permission once more).
+NOTIFIER_VERSION = "2"
+LSREGISTER = ("/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+              "LaunchServices.framework/Support/lsregister")
+NOTIFIER_STAMP = os.path.join(NOTIFIER_APP, "Contents", "Resources", "ctl-version")
+NOTIFIER_SOURCE = """\
+on open theFiles
+	repeat with f in theFiles
+		set lns to paragraphs of (read f as «class utf8»)
+		try
+			do shell script "rm -f " & quoted form of (POSIX path of f)
+		end try
+		if (count of lns) >= 2 then
+			set snd to ""
+			if (count of lns) >= 3 then set snd to item 3 of lns
+			if snd is "" then
+				display notification (item 2 of lns) with title (item 1 of lns)
+			else
+				display notification (item 2 of lns) with title (item 1 of lns) sound name snd
+			end if
+		end if
+	end repeat
+end open
+"""
 
 
-def _terminal_notifier():
+def _notifier_ready():
+    try:
+        with open(NOTIFIER_STAMP) as f:
+            return f.read().strip() == NOTIFIER_VERSION
+    except OSError:
+        return False
+
+
+def build_notifier():
+    """Build the droplet in a scratch dir and move it into place, so a
+    half-built app is never used and two hooks building at once can't
+    trample each other. Returns whether a usable app is in place."""
     import shutil
-    return shutil.which("terminal-notifier")
+    import tempfile
 
+    if _notifier_ready():
+        return True
+    work = tempfile.mkdtemp(prefix="notifier-", dir=BASE_DIR)
+    try:
+        src = os.path.join(work, "notifier.applescript")
+        with open(src, "w", encoding="utf-8") as f:
+            f.write(NOTIFIER_SOURCE)
+        app = os.path.join(work, NOTIFIER_NAME + ".app")
+        contents = os.path.join(app, "Contents")
+        resources = os.path.join(contents, "Resources")
+        plist = os.path.join(contents, "Info.plist")
 
-def notify(color, label):
-    """Fire a macOS notification for a red/green transition. Best-effort --
-    a notification that doesn't show (e.g. permission not granted) must
-    never block the hook.
+        def run(*cmd):
+            subprocess.run(cmd, check=True, capture_output=True, timeout=30)
 
-    Prefers `terminal-notifier` (a real colored dot as the notification's
-    app icon); falls back to plain osascript if it isn't installed, which
-    can't show a custom icon but still gets the wording right."""
-    title = label or "Claude Code"
-    subtitle, message = NOTIFY_COPY[color]
+        run("osacompile", "-o", app, src)
 
-    notifier = _terminal_notifier()
-    if notifier:
-        args = [notifier, "-title", title, "-subtitle", subtitle, "-message", message,
-                "-appIcon", NOTIFY_ICON[color], "-group", "claude-traffic-light-" + title]
-        if color == "red":
-            args += ["-sound", "default"]
+        iconset = os.path.join(work, "applet.iconset")
+        os.mkdir(iconset)
+        for size in (16, 32, 128, 256, 512):
+            for scale in (1, 2):
+                name = f"icon_{size}x{size}" + ("@2x" if scale == 2 else "") + ".png"
+                px = str(size * scale)
+                run("sips", "-z", px, px, NOTIFIER_ICON, "--out", os.path.join(iconset, name))
+        run("iconutil", "-c", "icns", iconset, "-o", os.path.join(resources, "applet.icns"))
+        # A droplet points CFBundleIconFile at droplet.icns, and newer
+        # osacompile also bundles an asset catalog that takes precedence
+        # over both -- point everything at our applet.icns.
+        _discard(os.path.join(resources, "droplet.icns"))
+        _discard(os.path.join(resources, "Assets.car"))
+        subprocess.run(["plutil", "-remove", "CFBundleIconName", plist], capture_output=True)
+        run("plutil", "-replace", "CFBundleIconFile", "-string", "applet", plist)
+
+        run("plutil", "-replace", "CFBundleIdentifier", "-string",
+            "local.claude-traffic-light.notifier.v" + NOTIFIER_VERSION, plist)
+        run("plutil", "-replace", "LSUIElement", "-bool", "YES", plist)  # no Dock icon
+        with open(os.path.join(resources, "ctl-version"), "w") as f:
+            f.write(NOTIFIER_VERSION)
+        run("codesign", "--force", "--deep", "--sign", "-", app)
+
+        if _notifier_ready():
+            return True  # another hook finished first
+        shutil.rmtree(NOTIFIER_APP, ignore_errors=True)
         try:
-            subprocess.run(args, capture_output=True, timeout=5)
-            return
-        except (OSError, subprocess.SubprocessError):
-            pass  # fall through to the osascript fallback below
+            os.rename(app, NOTIFIER_APP)
+        except OSError:
+            pass
+        subprocess.run([LSREGISTER, "-f", NOTIFIER_APP], capture_output=True, timeout=30)
+        return _notifier_ready()
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _notify_via_app(title, message, sound):
+    import uuid
+
+    if not build_notifier():
+        return False
+    os.makedirs(NOTIFY_QUEUE_DIR, exist_ok=True)
+    request = os.path.join(NOTIFY_QUEUE_DIR, uuid.uuid4().hex + ".txt")
+    try:
+        with open(request, "w", encoding="utf-8") as f:
+            f.write("\n".join(s.replace("\n", " ") for s in (title, message, sound or "")))
+        result = subprocess.run(["open", "-g", "-a", NOTIFIER_APP, request],
+                                capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        _discard(request)
+        return False
+    if result.returncode != 0:
+        _discard(request)
+        return False
+    return True
+
+
+def notify(color, repo):
+    """Fire a macOS notification for a red/green transition: a colored dot
+    plus the repo name as the title, one short line underneath, the
+    traffic-light app icon. Best-effort -- a notification that doesn't show
+    (e.g. permission not granted) must never block the hook. Falls back to
+    plain osascript (Script Editor's icon) if the droplet can't be built."""
+    title = NOTIFY_EMOJI[color] + " " + (repo or "Claude Code")
+    message = NOTIFY_MESSAGE[color]
+    sound = "Ping" if color == "red" else None
+
+    if _notify_via_app(title, message, sound):
+        return
 
     def esc(s):
         return s.replace("\\", "\\\\").replace('"', '\\"')
 
-    icon = "\U0001F534" if color == "red" else "\U0001F7E2"
-    script = (
-        f'display notification "{esc(message)}" '
-        f'with title "{esc(icon + " " + title)}" subtitle "{esc(subtitle)}"'
-    )
-    if color == "red":
-        script += ' sound name "Ping"'
+    script = f'display notification "{esc(message)}" with title "{esc(title)}"'
+    if sound:
+        script += f' sound name "{sound}"'
     try:
         subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
@@ -507,7 +636,7 @@ def write_status(session_id, color):
     state = update_state(path, color=color)
     modes = state.get("modes") or []
     if "notification" in modes and color != prev_color and color in ("red", "green"):
-        notify(color, state.get("label") or "Claude Code")
+        notify(color, state.get("repo") or state.get("label"))
 
 
 def main():
@@ -541,10 +670,10 @@ def main():
             ensure_controller()
         return
 
-    session_id, label, claude_pid = session_identity(hook_payload())
+    session_id, label, claude_pid, cwd = session_identity(hook_payload())
 
     if cmd == "start":
-        start_gui(session_id, label, claude_pid)
+        start_gui(session_id, label, claude_pid, cwd)
     elif cmd == "stop":
         stop_gui(session_id)
     elif cmd in ("green", "yellow", "red"):

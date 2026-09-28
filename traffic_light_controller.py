@@ -15,17 +15,26 @@ it isn't spawned per-session. Exactly one instance is meant to run at a
 time; status_updater_mac.py starts it (if not already running, tracked via
 ~/.claude_traffic/controller.pid) on every SessionStart and whenever
 `display` is run by hand, and it keeps running until quit from its own
-menu or the machine restarts.
+menu, the last session ends (status_updater_mac.stop_gui stops it), or
+its own idle check finds no session left -- the fallback for terminals
+that were killed outright and never ran SessionEnd.
 
 Toggling a mode here calls status_updater_mac.switch_active_modes(), which
 applies the new set to every currently tracked session immediately -- no
 restart of Claude Code needed.
 """
 import os
+import time
 
 import rumps
 
 import status_updater_mac as backend
+
+# How often to look for remaining sessions, and how long after launch to
+# wait before the first look -- the controller is started just before the
+# first session writes its state file, and by hand via `display`.
+IDLE_CHECK_S = 10
+STARTUP_GRACE_S = 60
 
 ICON = "\U0001F6A6"  # traffic light -- fixed, this is the switcher, not a status light
 
@@ -47,6 +56,18 @@ class Controller(rumps.App):
             None, rumps.MenuItem("Quit Controller", callback=self.quit)
         ]
         self.refresh_checks()
+        self.started = time.time()
+        self.idle_timer = rumps.Timer(self.check_idle, IDLE_CHECK_S)
+        self.idle_timer.start()
+
+    def check_idle(self, _timer):
+        if time.time() - self.started < STARTUP_GRACE_S:
+            return
+        with backend.slot_lock():
+            backend.sweep()
+            idle = not backend.any_sessions()
+        if idle:
+            self.quit()
 
     def _make_toggle(self, mode):
         def toggle(_sender):
